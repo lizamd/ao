@@ -480,6 +480,7 @@ class MXTensor(TorchAOBaseTensor):
             f"scale_e8m0_bits.dtype must be `torch.float8_e8m0fnu`, got {scale_e8m0_bits.dtype}"
         )
         assert qdata.dtype in (
+            torch.float8_e4m3fnuz,  # AMD FNUZ format for MI350/MI355
             torch.float8_e4m3fn,
             torch.float8_e5m2,
             torch.uint8,

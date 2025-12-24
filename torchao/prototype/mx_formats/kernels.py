@@ -20,6 +20,7 @@ from torchao.prototype.custom_fp_utils import (
 from torchao.prototype.mx_formats.config import ScaleCalculationMode
 from torchao.utils import (
     is_cuda_version_at_least,
+    is_MI350,
     is_sm_at_least_100,
     torch_version_at_least,
 )
@@ -1138,9 +1139,23 @@ else:
         raise AssertionError("needs torch version 2.8+ and triton")
 
 
-mxfp8_cuda_extension_available = is_sm_at_least_100() and is_cuda_version_at_least(
-    12, 8
+mxfp8_cuda_extension_available = (
+    (is_sm_at_least_100() and is_cuda_version_at_least(12, 8)) or
+    (torch.version.hip and is_MI350())  # Add ROCm MI350/MI355 support
 )
+
+# Load HIP extension for ROCm if available
+if mxfp8_cuda_extension_available and torch.version.hip:
+    try:
+        import os
+        import torchao
+        ext_path = os.path.join(os.path.dirname(torchao.__file__), '_C_mxfp8.so')
+        if os.path.exists(ext_path):
+            torch.ops.load_library(ext_path)
+            logger.info(f"Loaded MXFP8 HIP extension from {ext_path}")
+    except Exception as e:
+        logger.warning(f"Failed to load MXFP8 HIP extension: {e}")
+        mxfp8_cuda_extension_available = False
 
 if mxfp8_cuda_extension_available:
     lib = torch.library.Library("torchao", "FRAGMENT")
@@ -1153,6 +1168,9 @@ if mxfp8_cuda_extension_available:
         x: torch.Tensor,
         rowwise: bool = False,
         colwise: bool = True,
+        scale_dim_x: int = 1,
+        scale_dim_y: int = 32,
+        fp8_format: str = "e4m3",
         scaling_mode: str = "floor",
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -1165,7 +1183,10 @@ if mxfp8_cuda_extension_available:
             x: Input tensor to be quantized. Must be 2D with shape (rows, cols).
             rowwise: If True, compute rowwise scales.
             colwise: If True, compute colwise scales.
-            scaling_mode: Scaling mode for quantization. Defaults to "floor".
+            scale_dim_x: Block size for rowwise scaling (default: 1).
+            scale_dim_y: Block size for colwise scaling (default: 32).
+            fp8_format: FP8 format to use ("e4m3" or "e5m2", default: "e4m3").
+            scaling_mode: Scale calculation mode ("floor", "ceil", or "rceil", default: "floor").
 
         Returns:
             Tuple of (output_rowwise, output_colwise, scales_rowwise, scales_colwise)
@@ -1174,19 +1195,21 @@ if mxfp8_cuda_extension_available:
         assert x.ndim == 2
         rows, cols = x.shape
 
-        # Block size must be a multiple of 32.
-        block_size = 32
-        assert rows % block_size == 0, "rows must be a multiple of 32"
-        assert cols % block_size == 0, "cols must be a multiple of 32"
+        # For rowwise scaling, rows must be a multiple of scale_dim_x
+        # For colwise scaling, rows must be a multiple of scale_dim_y
+        if rowwise and rows % scale_dim_x != 0:
+            raise ValueError(f"rows must be a multiple of scale_dim_x={scale_dim_x}")
+        if colwise and rows % scale_dim_y != 0:
+            raise ValueError(f"rows must be a multiple of scale_dim_y={scale_dim_y}")
 
         output_rowwise, output_colwise, scales_rowwise, scales_colwise = (
             torch.ops.torchao.mxfp8_quantize.default(
                 x,
                 rowwise,
                 colwise,
-                1,  # scale_dim_x
-                block_size,  # scale_dim_y
-                "e4m3",  # fp8_format
+                scale_dim_x,
+                scale_dim_y,
+                fp8_format,
                 scaling_mode,
             )
         )
@@ -1286,3 +1309,13 @@ else:
         raise NotImplementedError(
             "`mxfp8_quantize_cuda` needs (1) torch 2.8+ and (2) torchao built from source on a machine with CUDA capability 10.0+. Please see https://github.com/pytorch/ao/issues/2932 for more details."
         )
+
+# Python wrapper for HIP kernel (MI350/MI355)
+if torch.version.hip and is_MI350():
+    try:
+        from torchao.prototype.mx_formats.mxfp8_hip_wrapper import mxfp8_quantize_hip
+        # Override the mxfp8_quantize_cuda function with our Python wrapper
+        mxfp8_quantize_cuda = mxfp8_quantize_hip
+        logger.info("Using Python-wrapped HIP kernel for MXFP8 on MI350/MI355")
+    except Exception as e:
+        logger.warning(f"Failed to load HIP kernel wrapper: {e}")
