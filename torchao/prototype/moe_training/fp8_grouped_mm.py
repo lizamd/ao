@@ -99,8 +99,11 @@ class _Float8GroupedMM(torch.autograd.Function):
         assert _is_column_major(B_t), "B must be column-major"
 
         # Convert high precision input tensor to float8, row-major for left operand of grouped GEMM.
+        # Uses fused Triton kernel that computes per-row absmax + scale + FP8 cast
+        # in a single kernel launch (replaces 3 separate ops: tensor_to_scale,
+        # multiply by scale, and to_fp8_saturated).
         # A shape: (M, K)
-        # A_scales shape: (M, 1)
+        # A_scales shape: (M, 1), forward scales (FP8_MAX / absmax)
         A_data_row_major, A_scales = triton_fp8_rowwise_2d_scale_and_cast(
             A,
             output_dtype=float8_dtype,
